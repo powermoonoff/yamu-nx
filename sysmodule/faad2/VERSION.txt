@@ -1,0 +1,1 @@
+FAAD2 2.11.4 (https://github.com/knik0/faad2), libfaad без изменений.

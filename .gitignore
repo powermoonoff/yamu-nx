@@ -1,0 +1,28 @@
+﻿# Сборка devkitPro
+build/
+*.elf
+*.nro
+*.nacp
+*.nso
+*.nsp
+*.npdm
+*.ovl
+*.map
+*.lst
+
+# Личное — никогда не коммитить
+token.txt
+handoff.json
+sys.log
+offline/
+
+# Системное
+.DS_Store
+Thumbs.db
+.vscode/
+
+# Скачанное со Свича (tools/switch-deploy.ps1 -Pull)
+switch-pull/
+
+# Старые версии, снятые с консоли при заливке (tools/switch-deploy.ps1)
+backups/
