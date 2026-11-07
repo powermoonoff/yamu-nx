@@ -10,6 +10,18 @@
 
 ---
 
+## 📸 Скриншоты
+
+| Главная | Плеер |
+| --- | --- |
+| ![Главная](docs/screenshots/home.jpg) | ![Плеер](docs/screenshots/player.jpg) |
+
+| Поиск |
+| --- |
+| ![Поиск](docs/screenshots/search.jpg) |
+
+---
+
 ## 🌟 Возможности
 
 ### 📱 Приложение
