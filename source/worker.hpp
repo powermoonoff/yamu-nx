@@ -7,6 +7,7 @@
 #include <vector>
 #include <switch.h>
 #include "yandex.hpp"
+#include "soundcloud.hpp"
 
 struct SDL_Surface;
 
@@ -16,7 +17,7 @@ constexpr const char *OFFLINE_DIR = "sdmc:/switch/yamu-nx/offline";
 constexpr const char *LYRICS_DIR = "sdmc:/switch/yamu-nx/lyrics";
 
 struct Job {
-    enum Kind { Startup, LoadWave, Resolve, Feedback, Cover, Library, OpenList, Like, Download, Search, Lyrics, ConnectQueue, LoginStart, LoginPoll, SearchAll, Artist, LikedAlbums, ListMore, TrackMeta } kind;
+    enum Kind { Startup, LoadWave, Resolve, Feedback, Cover, Library, OpenList, Like, Download, Search, Lyrics, ConnectQueue, LoginStart, LoginPoll, SearchAll, Artist, LikedAlbums, ListMore, TrackMeta, ScSearch, ScResolve, ScLogin, ScHome, ScRelated, ScWarm } kind;
     // LoadWave
     bool fresh = false;
     std::string lastTrackId;
@@ -105,9 +106,11 @@ public:
 private:
     static void entry(void *arg);
     void loop();
+    void downloadSoundCloud(const Track &t, JobResult &r);
     JobResult run(const Job &job);
 
     YandexApi api_;
+    SoundCloud sc_; // треки с id "sc:…" — через официальное API SoundCloud
     std::string tokenPath_;
     Thread thread_;
     bool running_ = false;

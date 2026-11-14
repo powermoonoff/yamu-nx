@@ -12,6 +12,10 @@ build/
 
 # Личное — никогда не коммитить
 token.txt
+soundcloud.txt
+soundcloud-user.json
+soundcloud-token.json
+proxy.txt
 handoff.json
 sys.log
 offline/

@@ -8,6 +8,7 @@
 #include <vector>
 #include "sysplayer.hpp"
 #include "yandex.hpp"
+#include "soundcloud.hpp"
 
 class Core {
 public:
@@ -39,6 +40,9 @@ private:
     void maybeCrossfade();
 
     YandexApi api_;
+    SoundCloud sc_; // треки "sc:…" — mp3-поток через официальное API (свой токен с карты)
+    // Адрес потока: Яндекс или SoundCloud — по id трека.
+    bool streamUrl(const std::string &id, std::string &url, int &kbps, std::string &codec, std::string &err);
     SysPlayer player_;
     std::string tokenPath_;
     bool loggedIn_ = false;
@@ -52,6 +56,7 @@ private:
     // Состояние под stateM_ (его читает сервер)
     mutable std::mutex stateM_;
     bool wave_ = true;
+    bool scWave_ = false; // волна SoundCloud из приложения: в конце очереди дописываем похожие
     std::string sourceTitle_ = "Моя волна";
     std::vector<Track> queue_;
     int current_ = -1;

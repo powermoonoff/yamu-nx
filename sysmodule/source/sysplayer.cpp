@@ -1,6 +1,7 @@
 ﻿#include "sysplayer.hpp"
 #include "http.hpp"
 #include "mp4demux.hpp"
+#include "soundcloud.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -34,7 +35,10 @@ public:
     std::string error() const;
 
 private:
-    static void netEntry(void *arg) { static_cast<SysDeck *>(arg)->netLoop(); }
+    static void netEntry(void *arg) {
+        static_cast<SysDeck *>(arg)->netLoop();
+        httpThreadDone(); // соединения через прокси, которые держал этот поток
+    }
     static void decodeEntry(void *arg) { static_cast<SysDeck *>(arg)->decodeLoop(); }
     void netLoop();
     void decodeLoop();
@@ -189,6 +193,48 @@ void SysDeck::netLoop() {
         while (!stop_ && (n = fread(chunk.data(), 1, chunk.size(), f)) > 0)
             if (!put(chunk.data(), n)) break;
         fclose(f);
+        std::lock_guard<std::mutex> lk(m_);
+        netDone_ = true;
+        return;
+    }
+
+    // HLS (SoundCloud, mp3): плейлист из кусков — качаем их по порядку в то же окно, для mpg123 это
+    // один поток. С середины — пропускаем куски по их длительностям. Кусок оборвался — докачиваем с того же байта.
+    if (src_.compare(0, 4, "hls:") == 0) {
+        std::string listUrl = src_.substr(4), err;
+        HttpResult pl = httpGet(listUrl, {});
+        std::vector<double> durs;
+        std::vector<std::string> parts =
+            pl.code == 200 ? hlsSegments(pl.body, pl.finalUrl.empty() ? listUrl : pl.finalUrl, &durs) : std::vector<std::string>();
+        if (pl.code != 200) err = pl.code < 0 ? pl.error : "HTTP " + std::to_string(pl.code);
+        else if (parts.empty()) err = "пустой плейлист";
+        size_t first = 0;
+        double acc = 0;
+        for (; first + 1 < parts.size() && acc + durs[first] <= startSec_; first++) acc += durs[first];
+        // Внутри первого куска — пропускаем байты до нужной секунды (mp3 почти всегда CBR).
+        size_t skip = startSec_ > acc && kbps_ > 0 ? (size_t)((startSec_ - acc) * kbps_ * 125) : 0;
+        ymLog("[hls] кусков %d, с %d", (int)parts.size(), (int)first);
+        for (size_t i = first; err.empty() && i < parts.size() && !stop_; i++) {
+            size_t got = i == first ? skip : 0;
+            HttpResult r;
+            for (int attempt = 0; attempt < 4 && !stop_; attempt++) {
+                if (attempt) svcSleepThread(700 * MS);
+                std::vector<std::string> hdr;
+                if (got) hdr.push_back("Range: bytes=" + std::to_string(got) + "-");
+                r = httpGet(parts[i], hdr, [&](const char *d, size_t n) {
+                    if (!put(d, n)) return false;
+                    got += n;
+                    return true;
+                });
+                if (r.code == 200 || r.code == 206 || r.code > 0) break;
+            }
+            // 416 — пропуск вышел за конец куска: просто идём к следующему.
+            if (!stop_ && r.code != 200 && r.code != 206 && r.code != 416) err = r.code < 0 ? r.error : "HTTP " + std::to_string(r.code);
+        }
+        if (!stop_ && !err.empty()) {
+            ymLog("[hls] ошибка: %s", err.c_str());
+            setError("Download: " + err);
+        }
         std::lock_guard<std::mutex> lk(m_);
         netDone_ = true;
         return;

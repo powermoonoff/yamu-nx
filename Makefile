@@ -40,7 +40,7 @@ include $(DEVKITPRO)/libnx/switch_rules
 TARGET		:=	yamu-nx
 APP_TITLE	:=	YaMu-nx
 APP_AUTHOR	:=	powermoonoff
-APP_VERSION	:=	0.1.0
+APP_VERSION	:=	0.2.0
 BUILD		:=	build
 SOURCES		:=	source common
 DATA		:=	data

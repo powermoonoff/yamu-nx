@@ -24,11 +24,14 @@
 #include "json.hpp"
 #include "connect.hpp"
 #include "crashlog.hpp"
+#include "soundcloud.hpp"
+#include "http.hpp"
 #include "player.hpp"
 #include "ui.hpp"
 #include "worker.hpp"
+#include "sclogin.hpp"
 
-static const char *VERSION = "0.1.0"; // локальные сборки для отладки — "developer"
+static const char *VERSION = "0.2.0"; // локальные сборки для отладки — "developer"
 static const char *TOKEN_PATH = "sdmc:/switch/yamu-nx/token.txt";
 static const u64 AUTO_SKIP_MS = 2500; // пауза перед пропуском неиграющего трека
 static const int COVER_BIG = 400, COVER_SMALL = 100;
@@ -46,6 +49,7 @@ enum Action {
     ActNone, ActPrev, ActPlay, ActNext, ActNewWave, ActRetry, ActLike, ActLibrary, ActBack, ActShuffle,
     ActDownload, ActDownloadAll, ActDelete, ActSeekBar, ActSearch, ActActivateSel, ActToList, ActPlayer, ActExit, ActShuffleMode, ActRepeat, ActHome, ActSettings, ActQueue, ActSeekBack, ActSeekFwd, ActLyrics, ActLoginNew, ActLoginCancel,
     ActOpenAlbum,         // в плеере: тап по названию — альбом трека
+    ActTabYa, ActTabSc,   // главная: вкладка «Яндекс» / «SoundCloud»
     ActArtistBase = 450,  // в плеере: тап по исполнителю (+его номер в треке)
     ActHomeBase = 500,    // плитка главного экрана (+индекс)
     ActSettingBase = 600, // строка настроек (+индекс)
@@ -119,6 +123,11 @@ struct App {
 
     // Открытый плейлист
     Playlist openList;
+    // SoundCloud: вход в аккаунт с телефона, имя вошедшего, волна по похожим
+    ScLoginServer scLogin;
+    std::string scVerifier, scUser;
+    bool scWave = false, scWaveLoading = false;
+    u64 scLogoutAt = 0; // первое нажатие «выйти» — ждём подтверждения
     std::vector<Track> listTracks;
     bool listLoading = false;
     bool listMore = false;   // «Мне нравится» ещё догружается порциями
@@ -145,7 +154,8 @@ struct App {
     bool volDrag = false;         // ведём пальцем по ползунку громкости
     std::string lastQuery; // последний поисковый запрос (подставляется в клавиатуру)
     // Своя экранная клавиатура поиска: у системной кириллица есть, только если консоль на русском.
-    struct Kbd { bool active = false, ru = true; int row = 1, col = 0; std::string text; } kbd;
+    // sc — искать в SoundCloud (в нём же ссылки soundcloud.com открываются напрямую).
+    struct Kbd { bool active = false, ru = true, sc = false; int row = 1, col = 0; std::string text; } kbd;
 
     // Передача музыки фоновому модулю и обратно
     struct Takeover { bool wave = false; std::string source; std::vector<Track> tracks; int current = -1; double pos = 0; bool paused = false; int repeat = 0; };
@@ -176,6 +186,8 @@ struct App {
     bool wantResume() const { return saveResume; }
     int crossfade = 0;      // плавный переход между треками, секунд (0 — выкл)
     std::string xfId, xfUrl, xfCodec; // следующий трек, заранее подготовленный для перехода
+    std::string scWarmId;             // следующий трек SoundCloud, для которого уже готовы адрес и плейлист
+    u64 scWarmAt = 0;
     int xfBitrate = 0;
 
     // Ynison («Яндекс Коннект»): Свич как устройство в Яндекс Музыке
@@ -201,6 +213,10 @@ struct App {
 
     // Главный экран, настройки, очередь
     int homeSel = 0;
+    int homeTab = 0;         // вкладка главной: 0 — Яндекс Музыка, 1 — SoundCloud
+    bool sideFocus = false;  // выбор в боковом меню главной (а не на плитках)
+    int sideSel = 0;         // пункт меню: 0 — Яндекс, 1 — SoundCloud, 2 — Настройки
+    bool listAutoPlay = false; // открытый список сразу играть, когда загрузится (волна SoundCloud с главной)
     ListView setView, queueView;
     // Оформление и главная (settings.json)
     int accent = 0, theme = 0; // индексы в col::ACCENTS (ACCENT_COUNT — свой цвет) и col::Theme
@@ -445,7 +461,10 @@ static void downloadTracks(App &app, const std::vector<Track> &tracks) {
         app.downloader.post(j);
         added++;
     }
-    if (!added) { showToast(app, tracks.size() == 1 ? "Уже скачано" : "Всё уже скачано"); return; }
+    if (!added) {
+        showToast(app, tracks.size() == 1 ? "Уже скачано" : "Всё уже скачано");
+        return;
+    }
     if (app.dlDone >= app.dlTotal) app.dlTotal = app.dlDone = app.dlFailed = 0; // новая пачка
     app.dlTotal += added;
     showToast(app, added == 1 ? "Скачиваю трек" : "Скачиваю " + tracksWord(added));
@@ -508,6 +527,15 @@ static void loadMoreWave(App &app, bool fresh) {
     app.worker.post(j);
 }
 
+// Волна SoundCloud: очередь подходит к концу — дописываем похожие на последний трек.
+static void loadMoreScWave(App &app) {
+    if (!app.scWave || app.scWaveLoading || app.queue.empty()) return;
+    app.scWaveLoading = true;
+    Job j{Job::ScRelated};
+    j.track = app.queue.back();
+    app.worker.post(j);
+}
+
 static void playIndex(App &app, int idx) {
     if (idx >= 0 && idx < (int)app.queue.size()) crashLog("трек %s", app.queue[idx].id.c_str());
     app.player.stop();
@@ -517,6 +545,7 @@ static void playIndex(App &app, int idx) {
     app.codec.clear();
     if (idx < 0) idx = 0;
     if (app.source == SrcWave && idx >= (int)app.queue.size() - UP_NEXT_ROWS - 1) loadMoreWave(app, false);
+    if (app.scWave && idx >= (int)app.queue.size() - UP_NEXT_ROWS - 1) loadMoreScWave(app);
     if (idx >= (int)app.queue.size() && app.source == SrcList && app.repeat == App::RepeatAll && !app.queue.empty())
         idx = 0; // повтор всего плейлиста — по кругу
     if (idx >= (int)app.queue.size()) {
@@ -550,6 +579,27 @@ static void playIndex(App &app, int idx) {
     j.index = idx;
     j.gen = app.gen;
     j.track = app.queue[idx];
+    app.worker.post(j);
+}
+
+// SoundCloud: пока играет трек, заранее узнаём адрес следующего и качаем его плейлист — переключение
+// без ~1 с запросов через прокси. Подписи адресов живут недолго, поэтому раз в 2 минуты освежаем.
+static void warmNextSc(App &app) {
+    if (app.offlineMode || app.handedOff || app.resolving || app.player.state() != Player::Playing) return;
+    if (app.current < 0 || app.current >= (int)app.queue.size()) return;
+    int next = app.current + 1;
+    if (next >= (int)app.queue.size()) {
+        if (app.source == SrcList && app.repeat == App::RepeatAll && !app.queue.empty()) next = 0;
+        else return;
+    }
+    const Track &nt = app.queue[next];
+    if (!isSoundCloudId(nt.id) || findOffline(app, nt.id)) return;
+    if (app.scWarmId == nt.id && nowMs() - app.scWarmAt < 120000) return;
+    if (app.scWarmId != nt.id && app.player.position() < 3) return; // только что включили — может, листают дальше
+    app.scWarmId = nt.id;
+    app.scWarmAt = nowMs();
+    Job j{Job::ScWarm};
+    j.track = nt;
     app.worker.post(j);
 }
 
@@ -604,6 +654,7 @@ static void maybeCrossfade(App &app) {
     prepareInModule(app, t);
     feedback(app, "trackStarted", &t);
     if (app.source == SrcWave && next >= (int)app.queue.size() - UP_NEXT_ROWS - 1) loadMoreWave(app, false);
+    if (app.scWave && next >= (int)app.queue.size() - UP_NEXT_ROWS - 1) loadMoreScWave(app);
 }
 
 static void seekTo(App &app, double sec) {
@@ -667,6 +718,7 @@ static void startWave(App &app, int preset = 0) {
     app.sourceTitle = titles[preset];
     app.shuffle = false;
     if (app.repeat == App::RepeatAll) app.repeat = App::RepeatOff;
+    app.scWave = false;
     app.queue.clear();
     app.current = -1;
     app.waveLoading = false;
@@ -679,6 +731,7 @@ static void playList(App &app, int idx, bool shuffle) {
     app.source = SrcList;
     app.sourceTitle = app.openList.title;
     app.queue = app.listTracks;
+    app.scWave = app.openList.kind == "@sc" && app.openList.owner == "@wave"; // волна SoundCloud — дописывается сама
     app.unshuffled = app.listTracks;
     std::mt19937 rng((unsigned)armGetSystemTick());
     if (shuffle) { // «Перемешать» — весь список вперемешку и шафл включается
@@ -707,6 +760,7 @@ static void openLibrary(App &app) {
 
 static void openList(App &app, const Playlist &pl) {
     app.listFromHome = false;
+    app.listAutoPlay = false;
     app.listFromPlayer = false;
     app.listFromRich = false;
     app.openList = pl;
@@ -740,11 +794,11 @@ static void openList(App &app, const Playlist &pl) {
 
 // Ряды букв; последний ряд — служебные клавиши (KEY_*), они общие для обеих раскладок.
 static const char *const KBD_RU[] = {"1234567890", "йцукенгшщзхъ", "фывапролджэ", "ячсмитьбюё"};
-static const char *const KBD_EN[] = {"1234567890", "qwertyuiop", "asdfghjkl'", "zxcvbnm-.&"};
+static const char *const KBD_EN[] = {"1234567890", "qwertyuiop", "asdfghjkl_", "zxcvbnm-./"}; // «_» и «/» — для ссылок и ников
 static const int KBD_LETTER_ROWS = 4;
-enum KbdKey { KEY_LANG, KEY_SYS, KEY_SPACE, KEY_BACK, KEY_OK, KEY_COUNT };
-static const char *const KBD_KEY_LABEL[] = {"", "Системная", "Пробел", "Стереть", "Найти"};
-static const int KBD_KEY_UNITS[] = {2, 3, 6, 3, 3}; // ширина в «клавишах»
+enum KbdKey { KEY_LANG, KEY_SVC, KEY_SYS, KEY_SPACE, KEY_BACK, KEY_OK, KEY_COUNT };
+static const char *const KBD_KEY_LABEL[] = {"", "", "Системная", "Пробел", "Стереть", "Найти"};
+static const int KBD_KEY_UNITS[] = {2, 3, 3, 4, 3, 3}; // ширина в «клавишах»
 
 // Буквы ряда как отдельные UTF-8 символы.
 static std::vector<std::string> kbdRow(const App &app, int row) {
@@ -767,6 +821,7 @@ static void popUtf8(std::string &s) {
 }
 
 static void openRichSearch(App &app, const std::string &q);
+static void openScSearch(App &app, const std::string &q);
 static void systemSearch(App &app);
 
 static void kbdSubmit(App &app) {
@@ -776,7 +831,8 @@ static void kbdSubmit(App &app) {
     if (q.empty()) { showToast(app, "Введите, что искать"); return; }
     app.kbd.active = false;
     app.lastQuery = q;
-    openRichSearch(app, q);
+    if (app.kbd.sc) openScSearch(app, q);
+    else openRichSearch(app, q);
 }
 
 // Нажатие клавиши: row/col — как в раскладке (служебные — в последнем ряду).
@@ -789,6 +845,7 @@ static void kbdPress(App &app, int row, int col) {
     }
     switch (col) {
         case KEY_LANG: k.ru = !k.ru; break;
+        case KEY_SVC: k.sc = !k.sc; break;
         case KEY_SYS: systemSearch(app); break;
         case KEY_SPACE: if (!k.text.empty() && k.text.back() != ' ' && k.text.size() < 100) k.text += ' '; break;
         case KEY_BACK: popUtf8(k.text); break;
@@ -824,10 +881,13 @@ static void kbdMove(App &app, int dx, int dy) {
 }
 
 // Поиск: своя клавиатура с русской раскладкой, результаты — как в Яндекс Музыке.
+static bool hasScTab();
+
 static void openSearch(App &app) {
     if (app.offlineMode) { showToast(app, "Нет сети — поиск недоступен"); return; }
     app.kbd.active = true;
     app.kbd.text = app.lastQuery;
+    if (app.screen == ScrHome && hasScTab()) app.kbd.sc = app.homeTab == 1; // с вкладки — поиск в её сервисе
     app.kbd.row = 1;
     app.kbd.col = 0;
 }
@@ -879,6 +939,56 @@ static void openRichSearch(App &app, const std::string &q) {
     app.worker.post(j);
 }
 
+// SoundCloud: поиск по словам или ссылка soundcloud.com/… (трек, плейлист, автор, закрытая /s-…).
+static void openScSearch(App &app, const std::string &q) {
+    if (!SoundCloud::configured()) {
+        showToast(app, "Нет ключей SoundCloud: файл switch/yamu-nx/soundcloud.txt");
+        return;
+    }
+    app.rich.clear();
+    app.richFromPlayer = false;
+    bool link = q.find("soundcloud.com") != std::string::npos || q.find("snd.sc") != std::string::npos;
+    App::RichPage p;
+    p.type = link ? 4 : 3; // 3 — поиск SoundCloud, 4 — открытая ссылка
+    p.title = link ? "SoundCloud: ссылка" : "SoundCloud: " + q;
+    p.query = q;
+    pushRich(app, p);
+    Job j{link ? Job::ScResolve : Job::ScSearch};
+    j.query = q;
+    app.worker.post(j);
+}
+
+// Главная SoundCloud (плитка): «Моё» — лайки, волна, лента; ниже — мои плейлисты и свежее от подписок.
+static void openScHome(App &app) {
+    if (!SoundCloud::configured()) { showToast(app, "Нет ключей SoundCloud: файл switch/yamu-nx/soundcloud.txt"); return; }
+    app.rich.clear();
+    app.richFromPlayer = false;
+    App::RichPage p;
+    p.type = 5;
+    p.title = app.scUser.empty() ? "SoundCloud" : "SoundCloud · " + app.scUser;
+    if (app.scUser.empty()) {
+        p.loading = false;
+        p.error = "Войдите в аккаунт: Настройки → SoundCloud";
+        pushRich(app, p);
+        return;
+    }
+    App::RichSection mine;
+    mine.title = "Моё";
+    const std::pair<const char *, const char *> items[] = {{"@wave", "Волна"}, {"@likes", "Мне нравится"}, {"@feed", "Лента подписок"}};
+    for (auto &it : items) {
+        Card c;
+        c.kind = Card::PlaylistCard;
+        c.id = "@sc";
+        c.owner = it.first;
+        c.title = it.second;
+        c.sub = "SoundCloud";
+        mine.cards.push_back(c);
+    }
+    p.sections.push_back(mine);
+    pushRich(app, p);
+    app.worker.post(Job{Job::ScHome});
+}
+
 static void openArtist(App &app, const Card &c) {
     App::RichPage p;
     p.type = 1;
@@ -919,6 +1029,7 @@ static void openCard(App &app, const Card &c) {
 // тогда сначала спрашиваем трек у API (Job::TrackMeta), а переходим, когда ответ придёт.
 static void openFromPlayer(App &app, const Track &t, int want) {
     if (app.offlineMode) { showToast(app, "Нет сети — страницы исполнителей и альбомов недоступны"); return; }
+    if (want == -2 && isSoundCloud(t)) { showToast(app, "У треков SoundCloud нет альбомов"); return; }
     bool needMeta = want == -2 ? t.albumId.empty() : want >= (int)t.artistIds.size() || t.artistIds[want].empty();
     if (needMeta) {
         if (app.metaWant != -1) return; // уже спросили
@@ -965,6 +1076,7 @@ static void activateRich(App &app, int idx) {
         return;
     }
     if (!sec.tracks.empty()) { // трек — играем треки этого блока с него
+        app.scWave = false;
         app.queue = sec.tracks;
         app.unshuffled.clear();
         app.shuffle = false;
@@ -982,6 +1094,7 @@ static void activateRich(App &app, int idx) {
 static void toggleLike(App &app) {
     if (app.current < 0 || app.current >= (int)app.queue.size()) return;
     const Track &t = app.queue[app.current];
+    if (isSoundCloud(t) && app.scUser.empty()) { showToast(app, "Для лайков войдите в SoundCloud: Настройки → SoundCloud"); return; }
     bool like = !app.liked.count(t.id);
     if (like) app.liked.insert(t.id); // сразу показываем, откатим при ошибке
     else app.liked.erase(t.id);
@@ -1133,14 +1246,14 @@ static bool writeSnapshot(App &app, const char *path, double pos, bool paused, i
     else if (to > maxTracks) { from = std::max(0, app.current - maxTracks / 6); to = std::min(to, from + maxTracks); }
     FILE *f = fopen(path, "w");
     if (!f) return false;
-    fprintf(f, "{\"wave\":%s,\"source\":\"%s\",\"current\":%d,\"pos\":%.1f,\"paused\":%s,\"repeat\":%d,\"tracks\":[",
-            app.source == SrcWave ? "true" : "false", jsonEsc(app.sourceTitle).c_str(), app.current - from, pos,
+    fprintf(f, "{\"wave\":%s,\"scWave\":%s,\"source\":\"%s\",\"current\":%d,\"pos\":%.1f,\"paused\":%s,\"repeat\":%d,\"tracks\":[",
+            app.source == SrcWave ? "true" : "false", app.scWave ? "true" : "false", jsonEsc(app.sourceTitle).c_str(), app.current - from, pos,
             paused ? "true" : "false", (int)app.repeat);
     for (int i = from; i < to; i++) {
         const Track &t = app.queue[i];
-        fprintf(f, "%s{\"id\":\"%s\",\"album\":\"%s\",\"title\":\"%s\",\"artists\":\"%s\",\"dur\":%lld,\"coverUri\":\"%s\"}",
+        fprintf(f, "%s{\"id\":\"%s\",\"album\":\"%s\",\"title\":\"%s\",\"artists\":\"%s\",\"dur\":%lld,\"coverUri\":\"%s\",\"liked\":%s}",
                 i > from ? "," : "", jsonEsc(t.id).c_str(), jsonEsc(t.albumId).c_str(), jsonEsc(t.title).c_str(),
-                jsonEsc(t.artists).c_str(), t.durationMs, jsonEsc(t.coverUri).c_str());
+                jsonEsc(t.artists).c_str(), t.durationMs, jsonEsc(t.coverUri).c_str(), app.liked.count(t.id) ? "true" : "false");
     }
     fputs("]}", f);
     fclose(f);
@@ -1153,6 +1266,8 @@ static bool writeSnapshot(App &app, const char *path, double pos, bool paused, i
 // HOME: Свич сразу глушит приложение, ждать бессмысленно — модуль подхватывает, как только готов.
 static bool handOff(App &app, bool homeButton) {
     if (!isPlaying(app) || app.handedOff) return false;
+    // Фоновый модуль играет только Яндекс: SoundCloud остаётся в приложении (в HOME звучит, пока не запустили игру).
+
     double pos = app.player.position();
     const double lead = homeButton ? 0.3 : 3.0;
     if (app.wantResume()) writeSnapshot(app, LAST_PATH, pos, true); // на случай, если модуль не подхватит
@@ -1233,6 +1348,7 @@ static void applyTakeover(App &app) {
     App::Takeover &t = app.takeover;
     app.source = t.wave ? SrcWave : SrcList;
     app.sourceTitle = t.source;
+    app.scWave = false;
     app.queue = t.tracks;
     app.repeat = (App::Repeat)std::max(0, std::min(2, t.repeat));
     app.shuffle = false; // исходный порядок не сохраняем — очередь уже в нужном виде
@@ -1259,11 +1375,38 @@ static const char *const PLAYER_BGS[] = {"обычный", "размытая о�
 static const char *const BOTTOM_ROWS[] = {"нет", "недавно играло", "мои плейлисты"};
 static const char *const TILE_STYLES[] = {"тёмные", "цвет акцента", "контур"};
 
+// Настройки → SoundCloud: войти (страница для телефона), отменить вход или выйти (нажать дважды).
+static void scAccountAction(App &app) {
+    if (!SoundCloud::configured()) { showToast(app, "Нет ключей SoundCloud: файл switch/yamu-nx/soundcloud.txt"); return; }
+    if (app.scLogin.running()) {
+        app.scLogin.stop();
+        showToast(app, "Вход в SoundCloud отменён");
+        return;
+    }
+    if (!app.scUser.empty()) {
+        if (app.scLogoutAt && nowMs() - app.scLogoutAt < 3000) {
+            app.scLogoutAt = 0;
+            Job j{Job::ScLogin}; // пустой код — выход
+            app.worker.post(j);
+            return;
+        }
+        app.scLogoutAt = nowMs();
+        showToast(app, "Нажмите ещё раз, чтобы выйти из SoundCloud");
+        return;
+    }
+    if (app.offlineMode) { showToast(app, "Нет сети"); return; }
+    app.scVerifier = SoundCloud::newVerifier();
+    std::string state = SoundCloud::newVerifier().substr(0, 20), err;
+    std::string addr = app.scLogin.start(SoundCloud::loginUrl(app.scVerifier, state), state, err);
+    if (addr.empty()) { showToast(app, "Вход в SoundCloud: " + err); return; }
+    showToast(app, "Откройте на телефоне (та же Wi-Fi): " + addr);
+}
+
 enum SettingRow {
     SetSeekStep, SetSeekKeys, SetCrossfade, SetConnect, SetSaveResume, SetAccount, SetAutoSave, SetSaveLyrics,
     SetSaveLikes, SetAccent, SetTheme, SetPlayerBg, SetTextSize, SetHomeTiles, SetHomeScreen, SetLayout, SetBottomRow,
     SetGreeting, SetClock, SetTileSize, SetTileStyle, SetCorners, SetColumns, SetSubtitles, SetNowCover, SetHomeBg, SetAnim,
-    SetBottomRow2, SetName, SetDate, SetAccentR, SetAccentG, SetAccentB
+    SetBottomRow2, SetName, SetDate, SetAccentR, SetAccentG, SetAccentB, SetProxy, SetScAccount
 };
 // Порядок на экране: заголовки разделов (row = -1) и строки. Подпункты автосохранения — с отступом.
 struct SetLine { int row; const char *header; };
@@ -1271,7 +1414,7 @@ static const SetLine SET_LINES[] = {
     {-1, "Воспроизведение"}, {SetSeekStep, nullptr}, {SetSeekKeys, nullptr}, {SetCrossfade, nullptr},
     {-1, "Оформление"}, {SetAccent, nullptr}, {SetAccentR, nullptr}, {SetAccentG, nullptr}, {SetAccentB, nullptr}, {SetTheme, nullptr}, {SetPlayerBg, nullptr}, {SetTextSize, nullptr},
     {SetHomeScreen, nullptr},
-    {-1, "Аккаунт и связь"}, {SetAccount, nullptr}, {SetConnect, nullptr},
+    {-1, "Аккаунт и связь"}, {SetAccount, nullptr}, {SetConnect, nullptr}, {SetScAccount, nullptr}, {SetProxy, nullptr},
     {-1, "Сохранение"}, {SetSaveResume, nullptr}, {SetAutoSave, nullptr}, {SetSaveLyrics, nullptr}, {SetSaveLikes, nullptr},
 };
 static const int SET_LINE_COUNT = sizeof(SET_LINES) / sizeof(SET_LINES[0]);
@@ -1309,17 +1452,39 @@ static int curSetting(App &app) { return settingAt(setTable(app.screen), curSetV
 // Плитки главной: порядок и скрытые (настройки скрыть нельзя — иначе до них не добраться).
 enum HomeTile {
     TileNow, TileWave, TileLikes, TileLists, TileOffline, TileSettings,
-    TileContinue, TileWaveUp, TileWaveCalm, TileWaveNew, // новые плитки — изначально скрыты
+    TileContinue, TileWaveUp, TileWaveCalm, TileWaveNew, TileSoundCloud, // новые плитки — изначально скрыты
     TILE_COUNT
 };
 static const int TILE_FIRST_NEW = TileContinue;
 static const char *const TILE_NAMES[] = {"Сейчас играет", "Моя волна", "Мне нравится", "Плейлисты", "Скачанное", "Настройки",
-                                         "Продолжить", "Волна: бодрое", "Волна: спокойное", "Волна: незнакомое"};
+                                         "Продолжить", "Волна: бодрое", "Волна: спокойное", "Волна: незнакомое", "SoundCloud"};
+
+// Плитки вкладки SoundCloud — свой постоянный набор (в «Плитках главной» не настраиваются).
+enum ScTile { TileScWave = 100, TileScLikes, TileScFeed, TileScLists, TileScAccount };
+static const char *tileName(int id) {
+    switch (id) {
+        case TileScWave: return "Волна";
+        case TileScLikes: return "Мне нравится";
+        case TileScFeed: return "Лента";
+        case TileScLists: return "Плейлисты";
+        case TileScAccount: return "Аккаунт";
+    }
+    return id >= 0 && id < TILE_COUNT ? TILE_NAMES[id] : "";
+}
+
+// Вкладки на главной — только если SoundCloud настроен (есть ключи).
+static bool hasScTab() {
+    static int known = -1; // configured() читает файл с карты — а спрашиваем каждый кадр
+    if (known < 0) known = SoundCloud::configured() ? 1 : 0;
+    return known == 1;
+}
 
 static std::vector<int> homeTiles(const App &app) {
+    if (app.homeTab == 1 && hasScTab()) return {TileNow, TileScWave, TileScLikes, TileScFeed, TileScLists, TileScAccount};
     std::vector<int> out;
     for (int t : app.tileOrder)
-        if (!app.tileHidden.count(t)) out.push_back(t);
+        if (!app.tileHidden.count(t) && t != TileSettings && !(t == TileSoundCloud && hasScTab())) // настройки и SoundCloud — в боковом меню
+            out.push_back(t);
     return out;
 }
 
@@ -1550,6 +1715,8 @@ static void changeSetting(App &app, int row, int dir) {
             else if (app.ready && !app.offlineMode) app.connect.start(TOKEN_PATH, app.deviceId, "Nintendo Switch", VERSION);
             break;
         case SetAccount: startLogin(app); return;
+        case SetProxy: showToast(app, "Прокси задаётся в файле switch/yamu-nx/proxy.txt (см. README)"); return;
+        case SetScAccount: scAccountAction(app); return;
         case SetAutoSave: app.autoSave = !app.autoSave; break;
         case SetSaveResume: app.saveResume = !app.saveResume; break;
         case SetSaveLyrics: app.saveLyrics = !app.saveLyrics; break;
@@ -1612,6 +1779,11 @@ static std::string settingValue(const App &app, int row) {
         case SetSaveLyrics: return onOff(app.saveLyrics);
         case SetSaveLikes: return onOff(app.saveLikes);
         case SetAccent: return app.accent >= col::ACCENT_COUNT ? "Свой" : col::ACCENTS[app.accent].name;
+        case SetProxy: return httpProxyInfo();
+        case SetScAccount:
+            if (app.scLogin.running()) return "на телефоне: " + app.scLogin.address();
+            if (!app.scUser.empty()) return app.scUser + "  ·  выйти";
+            return SoundCloud::configured() ? "войти  ›" : "нет ключей";
         case SetAccentR: return std::to_string(app.accentR);
         case SetAccentG: return std::to_string(app.accentG);
         case SetAccentB: return std::to_string(app.accentB);
@@ -1653,6 +1825,8 @@ static const char *settingTitle(int row) {
         case SetSaveLyrics: return "Тексты песен (читать без сети)";
         case SetSaveLikes: return "Лайкнутые треки → «Скачанное»";
         case SetAccent: return "Цвет акцента";
+        case SetProxy: return "Прокси";
+        case SetScAccount: return "SoundCloud";
         case SetAccentR: return "Свой цвет: красный";
         case SetAccentG: return "Свой цвет: зелёный";
         case SetAccentB: return "Свой цвет: синий";
@@ -1705,8 +1879,28 @@ static void playRecent(App &app, int idx);
 static bool hasCurrent(const App &app);
 
 static void activateTile(App &app, int tile) {
-    if (app.offlineMode && (tile == TileWave || tile == TileLikes || tile == TileLists)) {
+    if (app.offlineMode && (tile == TileWave || tile == TileLikes || tile == TileLists || tile == TileSoundCloud ||
+                            (tile >= TileScWave && tile != TileScAccount))) {
         showToast(app, "Нет сети — доступно только скачанное");
+        return;
+    }
+    if (tile >= TileScWave) { // вкладка SoundCloud
+        if (tile == TileScAccount) { // в настройки, сразу на строку «SoundCloud»
+            SetTable t = setTable(ScrSettings);
+            for (int pos = 0; pos < setRowCount(t); pos++)
+                if (settingAt(t, pos) == SetScAccount) app.setView.sel = pos;
+            app.screen = ScrSettings;
+            return;
+        }
+        if (app.scUser.empty()) { showToast(app, "Сначала войдите в SoundCloud: плитка «Аккаунт»"); return; }
+        if (tile == TileScLists) { openScHome(app); return; }
+        Playlist pl;
+        pl.kind = "@sc";
+        pl.owner = tile == TileScWave ? "@wave" : tile == TileScLikes ? "@likes" : "@feed";
+        pl.title = tile == TileScWave ? "Волна SoundCloud" : tile == TileScLikes ? "Мне нравится · SoundCloud" : "Лента подписок";
+        openList(app, pl);
+        app.listFromHome = true;
+        app.listAutoPlay = tile == TileScWave; // волну — сразу играть
         return;
     }
     switch (tile) {
@@ -1725,6 +1919,7 @@ static void activateTile(App &app, int tile) {
         case TileLists: openLibrary(app); break;
         case TileOffline: openList(app, offlinePlaylist(app)); app.listFromHome = true; break;
         case TileSettings: app.screen = ScrSettings; break;
+        case TileSoundCloud: openScHome(app); break;
         case TileWaveUp: case TileWaveCalm: case TileWaveNew:
             startWave(app, tile - TileWaveUp + 1);
             app.screen = ScrPlayer;
@@ -1789,6 +1984,7 @@ static void requestLyrics(App &app) {
     app.lyricsSynced = false;
     app.lyricsLoading = true;
     app.lyricsY = 0;
+    if (isSoundCloud(t)) { app.lyricsLoading = false; app.lyricsError = "У треков SoundCloud нет текстов"; return; }
     app.lyricsManualUntil = 0;
     Job j{Job::Lyrics};
     j.track = t;
@@ -1810,6 +2006,7 @@ static void playRecent(App &app, int idx) {
     if (idx < 0 || idx >= (int)app.recent.size()) return;
     app.playerFromRich = false;
     std::vector<Track> tracks = app.recent; // копия: playIndex сам двигает историю
+    app.scWave = false;
     app.queue = tracks;
     app.unshuffled.clear();
     app.shuffle = false;
@@ -1876,7 +2073,7 @@ static bool hasCurrent(const App &app) { return app.current >= 0 && app.current 
 
 // Отправить полное состояние (очередь + статус); activate — заодно объявить себя играющим устройством.
 static void ynSendState(App &app, bool activate) {
-    if (!app.connect.online() || !hasCurrent(app)) return;
+    if (!app.connect.online() || !hasCurrent(app) || isSoundCloud(app.queue[app.current])) return; // SoundCloud Яндексу не показываем
     // Очередь целиком бывает огромной — шлём окно вокруг текущего трека.
     int from = std::max(0, app.current - 50), to = std::min((int)app.queue.size(), app.current + 150);
     std::vector<Track> part(app.queue.begin() + from, app.queue.begin() + to);
@@ -1906,6 +2103,7 @@ static void ynApplyQueue(App &app, const std::vector<Track> &tracks) {
     for (int i = 0; i < (int)tracks.size(); i++)
         if (tracks[i].id == app.ynPending.id) { idx = i; break; }
     if (idx < 0 || !app.ynActive) return;
+    app.scWave = false;
     app.queue = tracks;
     app.unshuffled.clear();
     app.shuffle = false;
@@ -2079,6 +2277,78 @@ static void handleResult(App &app, JobResult &r) {
             if (app.connectOn) app.connect.start(TOKEN_PATH, app.deviceId, "Nintendo Switch", VERSION);
             break;
 
+        case Job::ScSearch:
+        case Job::ScResolve: { // SoundCloud: треки (и плейлисты при поиске) — на страницу запроса
+            int type = r.kind == Job::ScSearch ? 3 : 4;
+            App::RichPage *page = nullptr;
+            for (auto &p : app.rich) if (p.type == type && p.query == r.query) page = &p;
+            if (!page) break;
+            page->loading = false;
+            page->sections.clear();
+            if (!r.ok) { page->error = r.error; break; }
+            if (type == 4 && !r.lyrics.empty()) page->title = "SoundCloud: " + r.lyrics; // название найденного
+            if (!r.tracks.empty()) {
+                App::RichSection sec;
+                sec.title = type == 3 ? "Треки" : "";
+                sec.tracks = r.tracks;
+                page->sections.push_back(sec);
+            }
+            if (!r.cards.empty()) {
+                App::RichSection sec;
+                sec.title = "Плейлисты";
+                sec.cards = r.cards;
+                page->sections.push_back(sec);
+            }
+            if (page->sections.empty()) page->error = "Ничего не нашлось по запросу «" + r.query + "»";
+            break;
+        }
+
+        case Job::ScLogin:
+            if (r.query.empty()) { // выход
+                app.scUser.clear();
+                showToast(app, "Вышли из SoundCloud");
+                break;
+            }
+            if (!r.ok) { showToast(app, r.error); break; } // страница входа остаётся — можно повторить
+            app.scLogin.stop();
+            app.scUser = r.login.empty() ? "вход выполнен" : r.login;
+            showToast(app, "SoundCloud: вошли как " + app.scUser);
+            break;
+
+        case Job::ScHome: { // главная SoundCloud: «Моё» уже на странице, дописываем плейлисты и ленту
+            app.liked.insert(r.likedIds.begin(), r.likedIds.end()); // свежие лайки SoundCloud — отметки в плеере
+            App::RichPage *page = nullptr;
+            for (auto &p : app.rich) if (p.type == 5) page = &p;
+            if (!page) break;
+            page->loading = false;
+            if (!r.ok) { page->error = r.error; break; }
+            if (!r.cards.empty()) {
+                App::RichSection sec;
+                sec.title = "Мои плейлисты";
+                sec.cards = r.cards;
+                page->sections.push_back(sec);
+            }
+            if (!r.tracks.empty()) {
+                App::RichSection sec;
+                sec.title = "Свежее от подписок";
+                sec.tracks.assign(r.tracks.begin(), r.tracks.begin() + std::min<size_t>(20, r.tracks.size()));
+                page->sections.push_back(sec);
+            }
+            break;
+        }
+
+        case Job::ScRelated: { // волна SoundCloud: дописываем похожие, без повторов
+            app.scWaveLoading = false;
+            if (!app.scWave || !r.ok) break;
+            std::set<std::string> have;
+            for (auto &t : app.queue) have.insert(t.id);
+            int added = 0;
+            for (auto &t : r.tracks)
+                if (have.insert(t.id).second) { app.queue.push_back(t); app.unshuffled.push_back(t); added++; }
+            if (!added) crashLog("[sc] волна: похожих новых нет");
+            break;
+        }
+
         case Job::SearchAll: { // результаты — на страницу этого запроса, если она ещё открыта
             App::RichPage *page = nullptr;
             for (auto &p : app.rich) if (p.type == 0 && p.query == r.query) page = &p;
@@ -2123,8 +2393,9 @@ static void handleResult(App &app, JobResult &r) {
             if (!r.ok) { page->error = r.error; break; }
             if (!r.tracks.empty()) {
                 App::RichSection sec;
-                sec.title = "Популярные треки";
-                sec.tracks.assign(r.tracks.begin(), r.tracks.begin() + std::min<size_t>(10, r.tracks.size()));
+                bool sc = isSoundCloudId(r.artistId); // у автора SoundCloud — все его треки
+                sec.title = sc ? "Треки" : "Популярные треки";
+                sec.tracks.assign(r.tracks.begin(), r.tracks.begin() + (sc ? r.tracks.size() : std::min<size_t>(10, r.tracks.size())));
                 page->sections.push_back(sec);
             }
             // Альбомы исполнителя, синглы и чужие альбомы (сборники, совместные) — отдельными рядами.
@@ -2292,7 +2563,14 @@ static void handleResult(App &app, JobResult &r) {
             app.listTracks = r.tracks;
             app.listMore = r.more;
             if (app.openList.kind.empty()) app.liked.insert(r.likedIds.begin(), r.likedIds.end());
+            if (app.openList.kind == "@sc" && app.openList.owner == "@likes") // лайки SoundCloud — отмечаем в плеере
+                for (auto &t : r.tracks) app.liked.insert(t.id);
             if (app.listTracks.empty()) app.listError = "Здесь пока пусто";
+            if (app.listAutoPlay && !app.listTracks.empty() && app.screen == ScrList) { // волна SoundCloud с главной
+                playList(app, 0, false);
+                app.screen = ScrPlayer;
+            }
+            app.listAutoPlay = false;
             break;
 
         case Job::ListMore: // следующая порция «Мне нравится»: дописываем в конец, выбор не трогаем
@@ -2405,6 +2683,13 @@ static void doAction(App &app, int act) {
         case ActSeekFwd: seekTo(app, app.player.position() + app.seekStep); break;
         case ActShuffle: playList(app, 0, true); break;
         case ActSearch: openSearch(app); break;
+        case ActTabYa: case ActTabSc: { // раздел главной: Яндекс / SoundCloud
+            int tab = act == ActTabSc ? 1 : 0;
+            if (app.homeTab != tab) app.homeSel = 0;
+            app.homeTab = tab;
+            if (app.sideFocus) app.sideSel = tab;
+            break;
+        }
         case ActOpenAlbum: if (hasCurrent(app)) openFromPlayer(app, app.queue[app.current], -2); break;
         case ActActivateSel: // тап по «Открыть/Играть» — как A на выбранной строке
             if (app.screen == ScrHome) activateHome(app, app.homeSel);
@@ -2785,12 +3070,21 @@ static void drawMiniPlayer(App &app) {
 
 // ---------- главная, настройки, очередь ----------
 
-static const int HOME_X = 70, HOME_TOP = 104, HOME_BOTTOM = LIST_BOTTOM, HOME_GAP = 20;
+static const int SIDE_W = 290; // боковое меню главной: Яндекс, SoundCloud, Настройки
+static const int HOME_X = SIDE_W + 34, HOME_R = 70, HOME_TOP = 104, HOME_BOTTOM = LIST_BOTTOM, HOME_GAP = 20;
 static const int ROW_H = 186, ROW_ITEM = 124, ROW_STEP = 160; // ряд снизу: высота, обложка, шаг
 
 static float animTime() { return armTicksToNs(armGetSystemTick()) / 1e9f; }
 
 static void drawTileIcon(Ui &ui, int tile, int x, int y, SDL_Color c, SDL_Color hole) {
+    if (tile == TileScFeed) { // лента: три полосы
+        for (int i = 0; i < 3; i++) ui.rect(x + 2, y + 2 + i * 16, 58, 9, c);
+        return;
+    }
+    if (tile == TileScWave) tile = TileWave; // остальные плитки SoundCloud — с теми же значками
+    else if (tile == TileScLikes) tile = TileLikes;
+    else if (tile == TileScLists) tile = TileLists;
+    else if (tile == TileScAccount) tile = TileSoundCloud;
     switch (tile) {
         case TileWave: case TileWaveUp: case TileWaveCalm: case TileWaveNew: // синусоида
             for (int i = 0; i < 24; i++) {
@@ -2803,6 +3097,12 @@ static void drawTileIcon(Ui &ui, int tile, int x, int y, SDL_Color c, SDL_Color 
             for (int i = 0; i < 3; i++) { ui.circle(x + 6, y + 8 + i * 16, 5, c); ui.rect(x + 18, y + 5 + i * 16, 44, 6, c); }
             break;
         case TileOffline: ui.downArrow(x + 30, y + 22, 44, c); break;
+        case TileSoundCloud: // облако
+            ui.circle(x + 18, y + 30, 12, c);
+            ui.circle(x + 34, y + 22, 17, c);
+            ui.circle(x + 50, y + 30, 12, c);
+            ui.rect(x + 18, y + 30, 32, 12, c);
+            break;
         case TileContinue: // круг со стрелкой и «играть» внутри
             for (int i = 0; i < 20; i++) {
                 float a0 = 0.6f + i * 0.26f, a1 = a0 + 0.26f;
@@ -2836,6 +3136,7 @@ static bool stationColor(int id, SDL_Color &c) {
     if (id == TileWaveUp) c = {255, 149, 64, 255};
     else if (id == TileWaveCalm) c = {48, 200, 190, 255};
     else if (id == TileWaveNew) c = {155, 110, 255, 255};
+    else if (id == TileScWave) c = {255, 110, 30, 255}; // оранжевый SoundCloud
     else return false;
     return true;
 }
@@ -2972,7 +3273,8 @@ static void drawTile(App &app, int id, int x, int y, int w, int h, bool sel, int
     addButton(app, x, y, w, h, ActHomeBase + item);
     if (id == TileNow) { drawNowTile(app, L, x, y, w, h); return; }
 
-    bool disabled = app.offlineMode && (id == TileWave || id == TileLikes || id == TileLists || isStation);
+    bool disabled = app.offlineMode && (id == TileWave || id == TileLikes || id == TileLists || isStation ||
+                                         (id >= TileScWave && id != TileScAccount));
     SDL_Color fg = disabled ? col::dim : L.fg, icon = disabled ? col::dim : L.icon;
     SDL_Color hole = isStation ? station : app.tileStyle == 1 ? col::yellow : app.tileStyle == 2 ? col::bg : col::panel;
     std::string sub;
@@ -2984,6 +3286,14 @@ static void drawTile(App &app, int id, int x, int y, int w, int h, bool sel, int
     else if (id == TileWaveUp) sub = disabled ? "Нужна сеть" : "Энергичнее и громче";
     else if (id == TileWaveCalm) sub = disabled ? "Нужна сеть" : "Для фона и работы";
     else if (id == TileWaveNew) sub = disabled ? "Нужна сеть" : "Новое для вас";
+    else if (id >= TileScWave) {
+        bool in = !app.scUser.empty();
+        if (id == TileScAccount) sub = app.scLogin.running() ? "Идёт вход…" : in ? app.scUser : "Войти в SoundCloud";
+        else if (disabled) sub = "Нужна сеть";
+        else if (!in) sub = "Нужен вход в аккаунт";
+        else sub = id == TileScWave ? "Похожее на ваши лайки" : id == TileScLikes ? "Лайки SoundCloud"
+                 : id == TileScFeed ? "Новое от подписок" : "Ваши и сохранённые";
+    }
     else if (id == TileContinue) {
         if (hasCurrent(app)) sub = app.queue[app.current].title + " · " + fmtTime(app.player.state() == Player::Idle && app.pendingSeek >= 0 ? app.pendingSeek : app.player.position());
         else sub = app.recent.empty() ? "Пока нечего продолжать" : app.recent[0].title;
@@ -2991,13 +3301,20 @@ static void drawTile(App &app, int id, int x, int y, int w, int h, bool sel, int
 
     if (h < 100) { // строка списка: значок слева, справа подпись
         drawTileIcon(ui, id, x + 18, y + h / 2 - 22, icon, hole);
-        ui.text(TILE_NAMES[id], x + 104, y + h / 2 - 16, 26, fg, Align::Left, w / 2);
+        ui.text(tileName(id), x + 104, y + h / 2 - 16, 26, fg, Align::Left, w / 2);
         if (app.subtitles) ui.text(sub, x + w - 22, y + h / 2 - 11, 18, L.sub, Align::Right, w / 2 - 110);
+        return;
+    }
+    if (h < 150) { // низкая плитка (4 ряда): над названием иконке места нет — ставим её слева
+        drawTileIcon(ui, id, x + 22, y + h / 2 - 22, icon, hole);
+        int ty2 = app.subtitles ? y + h / 2 - 30 : y + h / 2 - 15;
+        ui.text(tileName(id), x + 104, ty2, 24, fg, Align::Left, w - 124);
+        if (app.subtitles) ui.text(sub, x + 104, ty2 + 34, 18, L.sub, Align::Left, w - 124);
         return;
     }
     drawTileIcon(ui, id, x + 24, y + (h >= 200 ? 32 : 20), icon, hole);
     int ty = y + h - (app.subtitles ? (h >= 200 ? 100 : 74) : (h >= 200 ? 62 : 48));
-    ui.text(TILE_NAMES[id], x + 24, ty, h >= 200 ? 28 : 24, fg, Align::Left, w - 48);
+    ui.text(tileName(id), x + 24, ty, h >= 200 ? 28 : 24, fg, Align::Left, w - 48);
     if (app.subtitles) ui.text(sub, x + 24, ty + (h >= 200 ? 42 : 34), 18, L.sub, Align::Left, w - 48);
 }
 
@@ -3017,7 +3334,7 @@ static void drawCoverRow(App &app, int mode, int y, int &scroll) {
                 HOME_X, y + 70, 20, col::dim);
         return;
     }
-    const int visible = (Ui::W - 2 * HOME_X + HOME_GAP) / ROW_STEP;
+    const int visible = (Ui::W - HOME_X - HOME_R + HOME_GAP) / ROW_STEP;
     int first = (int)app.homeItems.size(), selInRow = app.homeSel - first;
     if (selInRow >= 0 && selInRow < n) { // выбор в этом ряду — держим его в видимой части
         if (selInRow < scroll) scroll = selInRow;
@@ -3053,18 +3370,60 @@ static void drawCoverRow(App &app, int mode, int y, int &scroll) {
     }
 }
 
+// Пункты бокового меню: Яндекс, SoundCloud (если настроен), Настройки.
+static std::vector<int> sideItems() {
+    if (hasScTab()) return {0, 1, 2};
+    return {0, 2};
+}
+static const SDL_Color SC_ORANGE{255, 110, 30, 255};
+
+// Боковое меню главной: разделы сверху, общие настройки — внизу.
+static void drawSidebar(App &app) {
+    Ui &ui = app.ui;
+    SDL_Color side{(u8)((col::bg.r + col::panel.r) / 2), (u8)((col::bg.g + col::panel.g) / 2),
+                   (u8)((col::bg.b + col::panel.b) / 2), 255};
+    ui.rect(0, 0, SIDE_W, HOME_BOTTOM, side);
+    ui.text("YaMu-nx", 34, 36, 32, col::yellow);
+    for (int item : sideItems()) {
+        int y = item == 2 ? HOME_BOTTOM - 96 : 106 + item * 76;
+        bool active = item == 2 ? app.screen == ScrSettings : app.homeTab == item;
+        bool focus = app.sideFocus && app.sideSel == item;
+        SDL_Color accent = item == 1 ? SC_ORANGE : col::yellow;
+        if (focus) {
+            ui.roundRect(14, y - 4, SIDE_W - 28, 68, 14, col::yellow);
+            ui.roundRect(17, y - 1, SIDE_W - 34, 62, 12, col::panel);
+        } else if (active) ui.roundRect(14, y - 4, SIDE_W - 28, 68, 14, col::panel);
+        if (active) ui.rect(14, y + 12, 5, 36, accent);
+        SDL_Color ic = active || focus ? accent : col::gray;
+        int tile = item == 0 ? TileWave : item == 1 ? TileSoundCloud : TileSettings;
+        { // значок поменьше: те же фигуры, что на плитках, в масштабе 0.6
+            const float s = 0.6f;
+            float bx = 1, by = 1; // в доке масштаб уже не 1 (1080p) — домножаем и возвращаем как было
+            SDL_RenderGetScale(ui.renderer(), &bx, &by);
+            SDL_RenderSetScale(ui.renderer(), bx * s, by * s);
+            drawTileIcon(ui, tile, (int)(38 / s), (int)((y + 16) / s), ic, active || focus ? col::panel : side);
+            SDL_RenderSetScale(ui.renderer(), bx, by);
+        }
+        ui.text(item == 0 ? "Яндекс" : item == 1 ? "SoundCloud" : "Настройки", 92, y + 14, 26,
+                active || focus ? col::white : col::gray, Align::Left, SIDE_W - 104);
+        addButton(app, 14, y - 4, SIDE_W - 28, 68, item == 0 ? ActTabYa : item == 1 ? ActTabSc : ActSettings);
+    }
+}
+
 // Главная: плитки и закладки в выбранной раскладке, под ними — ряды обложек (если включены).
 static void drawHome(App &app) {
+    drawSidebar(app);
     std::vector<int> tiles = homeTiles(app);
     app.homeItems.clear();
     // Ячейки: плитки, затем закладки (kind 3).
     struct Cell { int kind, id; };
     std::vector<Cell> cells;
     for (int t : tiles) cells.push_back({0, t});
-    for (int b = 0; b < (int)app.bookmarks.size(); b++) cells.push_back({3, b});
+    if (app.homeTab == 0 || !hasScTab()) // закладки — на вкладке Яндекса
+        for (int b = 0; b < (int)app.bookmarks.size(); b++) cells.push_back({3, b});
 
     int rows = (app.bottomRow ? 1 : 0) + (app.bottomRow2 ? 1 : 0);
-    const int areaW = Ui::W - 2 * HOME_X;
+    const int areaW = Ui::W - HOME_X - HOME_R;
     const int bottom = HOME_BOTTOM - rows * ROW_H;
     const int areaH = bottom - HOME_TOP;
     const int maxH = app.tileCompact ? 160 : 230;
@@ -3091,8 +3450,8 @@ static void drawHome(App &app) {
     for (int i = 0; i < cellCount; i++) {
         const App::HomeItem &it = app.homeItems[i];
         const SDL_Rect &r = it.rc;
-        if (it.kind == 3) drawBookmarkTile(app, it.id, r.x, r.y, r.w, r.h, i == app.homeSel, i);
-        else drawTile(app, it.id, r.x, r.y, r.w, r.h, i == app.homeSel, i);
+        if (it.kind == 3) drawBookmarkTile(app, it.id, r.x, r.y, r.w, r.h, i == app.homeSel && !app.sideFocus, i);
+        else drawTile(app, it.id, r.x, r.y, r.w, r.h, i == app.homeSel && !app.sideFocus, i);
     }
     int ry = bottom + 8;
     if (app.bottomRow) { drawCoverRow(app, app.bottomRow, ry, app.rowScroll); ry += ROW_H; }
@@ -3200,7 +3559,7 @@ static void drawSettings(App &app) {
         bool off = rgb ? app.accent != col::ACCENT_COUNT : sub && !app.autoSave; // подпункты: автосохранение, свой цвет
         if (sel) ui.roundRect(x - 12, y - 2, w + 24, rowH - 6, 12, col::panel);
         ui.text(settingTitle(row), x + (sub ? 36 : 0), y + 12, sub ? 22 : 24, off ? col::dim : col::white);
-        std::string v = row == SetHomeTiles || row == SetHomeScreen ? settingValue(app, row) : "‹  " + settingValue(app, row) + "  ›";
+        std::string v = row == SetHomeTiles || row == SetHomeScreen || row == SetProxy || row == SetScAccount ? settingValue(app, row) : "‹  " + settingValue(app, row) + "  ›";
         ui.text(v, x + w - 8, y + 14, 22, off ? col::dim : sel ? col::yellow : col::gray, Align::Right);
         if (row == SetAccent) ui.circle(x + w - 8 - ui.textWidth(v, 22) - 18, y + 26, 9, col::yellow); // образец цвета
         addButton(app, x - 12, y - 2, w + 24, rowH - 6, ActSettingBase + pos);
@@ -3394,7 +3753,7 @@ static void drawRich(App &app) {
     app.richRows.clear();
     if (app.rich.empty()) return;
     App::RichPage &page = app.rich.back();
-    if (page.loading) { ui.text(page.type == 0 ? "Ищу «" + page.query + "»…" : "Загружаю…", Ui::W / 2, 320, 26, col::gray, Align::Center); return; }
+    if (page.loading) { ui.text(page.type == 0 || page.type == 3 ? "Ищу «" + page.query + "»…" : "Загружаю…", Ui::W / 2, 320, 26, col::gray, Align::Center); return; }
     if (!page.error.empty()) { ui.text(page.error, Ui::W / 2, 300, 24, col::gray, Align::Center, 1100); return; }
 
     // Сначала раскладываем всё в координатах содержимого (y от 0), потом сдвигаем на прокрутку.
@@ -3429,7 +3788,9 @@ static void drawRich(App &app) {
             for (int i = 0; i < n; i++)
                 app.richItems.push_back({s, i, {x0 + i * CARD_STEP - (int)sec.sx, y, CARD_W, CARD_W + 52}});
             app.richRows.push_back({s, {0, y, Ui::W, CARD_W + 52}});
-            y += CARD_H;
+            // «Лучший результат» рисуется одной крупной карточкой высотой 146, а не рядом (236)
+            bool best = s == 0 && page.type == 0 && sec.title == "Лучший результат";
+            y += best ? 146 : CARD_H;
         }
         y += 18;
     }
@@ -3539,13 +3900,13 @@ static void drawKbd(App &app) {
     shade.a = 225;
     ui.rect(0, 0, Ui::W, Ui::H - 58, shade);
 
-    ui.text("Поиск в Яндекс Музыке", 70, 36, 34, col::white);
+    ui.text(k.sc ? "Поиск в SoundCloud" : "Поиск в Яндекс Музыке", 70, 36, 34, col::white);
     ui.text(k.ru ? "Русская раскладка" : "English", Ui::W - 70, 46, 20, col::gray, Align::Right);
     // Поле ввода с мигающим курсором
     const int fx = 70, fy = 100, fw = Ui::W - 140, fh = 72;
     ui.roundRect(fx, fy, fw, fh, 18, col::panel);
     int tw = 0;
-    if (k.text.empty()) ui.text("Трек, исполнитель или альбом", fx + 28, fy + 20, 28, col::dim, Align::Left, fw - 56);
+    if (k.text.empty()) ui.text(k.sc ? "Трек, автор или ссылка soundcloud.com/…" : "Трек, исполнитель или альбом", fx + 28, fy + 20, 28, col::dim, Align::Left, fw - 56);
     else tw = ui.text(k.text, fx + 28, fy + 20, 28, col::white, Align::Left, fw - 70);
     if ((nowMs() / 500) % 2 == 0) ui.rect(fx + 30 + tw, fy + 18, 3, 36, col::yellow);
 
@@ -3572,7 +3933,7 @@ static void drawKbd(App &app) {
                 SDL_Color bg = sel ? col::yellow : col::panel;
                 SDL_Color fg = sel ? col::black : c == KEY_OK ? col::yellow : col::white; // «Найти» — акцентом
                 ui.roundRect(x, y, w, keyH, 14, bg);
-                std::string label = c == KEY_LANG ? (k.ru ? "EN" : "RU") : KBD_KEY_LABEL[c];
+                std::string label = c == KEY_LANG ? (k.ru ? "EN" : "RU") : c == KEY_SVC ? (k.sc ? "Яндекс" : "SoundCloud") : KBD_KEY_LABEL[c];
                 ui.text(label, x + w / 2, y + 20, 26, fg, Align::Center, w - 16);
                 addButton(app, x, y, w, keyH, ActKbdBase + row * 100 + c);
                 x += w + gap;
@@ -3597,9 +3958,15 @@ static void draw(App &app) {
     std::string header = app.screen == ScrHome ? (app.greeting ? greeting(app) : "Главная") : app.screen == ScrPlayer ? app.sourceTitle
                        : app.screen == ScrLibrary ? "Плейлисты" : app.screen == ScrSettings ? "Настройки" : app.screen == ScrTiles ? "Плитки главной" : app.screen == ScrHomeSet ? "Главный экран" : app.screen == ScrRich && !app.rich.empty() ? app.rich.back().title
                        : app.screen == ScrQueue ? "Очередь" : app.screen == ScrLyrics ? "Текст песни" : app.openList.title;
-    ui.text(header, 70, 36, 34, col::white, Align::Left, 660);
-    if (app.screen == ScrHome && app.showDate && app.started && !app.loginFlow.active) ui.text(todayText(), 72, 76, 18, col::gray);
-    if (!app.login.empty()) {
+    // На главной слева боковое меню — шапка начинается правее него.
+    bool side = app.screen == ScrHome && app.started && app.startupError.empty() && !app.loginFlow.active;
+    bool scTab = side && hasScTab() && app.homeTab == 1;
+    int hx = side ? HOME_X : 70;
+    ui.text(header, hx, 36, 34, col::white, Align::Left, side ? 740 - hx : 660);
+    if (app.screen == ScrHome && app.showDate && app.started && !app.loginFlow.active) ui.text(todayText(), hx + 2, 76, 18, col::gray);
+    if (scTab) { // на вкладке SoundCloud справа — аккаунт SoundCloud
+        if (!app.scUser.empty()) ui.text(app.scUser, Ui::W - 70, 46, 20, col::gray, Align::Right, Ui::W - 70 - 910);
+    } else if (!app.login.empty()) {
         int x = Ui::W - 70;
         if (app.hasPlus) {
             int w = ui.textWidth("Плюс", 18) + 20;
@@ -3700,6 +4067,11 @@ static void draw(App &app) {
     } else if (app.screen == ScrHome) {
         drawHint(app, x, hy, glyph::A, "Открыть", ActActivateSel);
         drawHint(app, x, hy, glyph::Minus, "Поиск", ActSearch);
+        if (hasScTab()) {
+            drawHint(app, x, hy, glyph::L, "", ActTabYa);
+            x -= 26;
+            drawHint(app, x, hy, glyph::R, "Раздел", ActTabSc);
+        }
         if (hasTrack) drawHint(app, x, hy, glyph::X, "Плеер", ActPlayer);
     } else if (app.screen == ScrTiles) {
         drawHint(app, x, hy, glyph::A, "Показать / скрыть", ActActivateSel);
@@ -3840,6 +4212,22 @@ static void handleInput(App &app, PadState &pad, u64 down) {
     switch (app.screen) {
         case ScrHome: { // переход к ближайшему элементу в сторону нажатия — работает в любой раскладке
             int dx = (down & LEFT) ? -1 : (down & RIGHT) ? 1 : 0, dy = (down & UP) ? -1 : (down & DOWN) ? 1 : 0;
+            if (hasScTab() && (down & HidNpadButton_L)) doAction(app, ActTabYa);
+            if (hasScTab() && (down & HidNpadButton_R)) doAction(app, ActTabSc);
+            if (app.sideFocus) { // боковое меню: вверх/вниз — раздел сразу, A на «Настройках» — открыть их
+                std::vector<int> items = sideItems();
+                int k = (int)(std::find(items.begin(), items.end(), app.sideSel) - items.begin());
+                if (k >= (int)items.size()) k = 0;
+                if (dy) k = std::max(0, std::min((int)items.size() - 1, k + dy));
+                app.sideSel = items[k];
+                if (dy && app.sideSel != 2 && app.homeTab != app.sideSel) {
+                    app.homeTab = app.sideSel;
+                    app.homeSel = 0;
+                }
+                if (dx > 0 || ((down & HidNpadButton_A) && app.sideSel != 2)) app.sideFocus = false;
+                else if ((down & HidNpadButton_A) && app.sideSel == 2) doAction(app, ActSettings);
+                return;
+            }
             if ((dx || dy) && app.homeSel < (int)app.homeItems.size()) {
                 const SDL_Rect &c = app.homeItems[app.homeSel].rc;
                 float cx = c.x + c.w / 2.0f, cy = c.y + c.h / 2.0f, best = 1e9f;
@@ -3854,6 +4242,10 @@ static void handleInput(App &app, PadState &pad, u64 down) {
                     if (score < best) { best = score; pick = i; }
                 }
                 if (pick >= 0) app.homeSel = pick;
+                else if (dx < 0) { // левее плиток ничего — в боковое меню, на текущий раздел
+                    app.sideFocus = true;
+                    app.sideSel = hasScTab() ? app.homeTab : 0;
+                }
             }
             if (down & HidNpadButton_A) activateHome(app, app.homeSel);
             return;
@@ -4002,8 +4394,23 @@ int main(int argc, char *argv[]) {
     int touchStartX = 0, touchStartY = 0, touchLastX = 0, touchLastY = 0, dragAccum = 0;
     AppletFocusState lastFocus = AppletFocusState_InFocus;
     bool exitedByUser = false;
+    if (SoundCloud::loggedIn()) {
+        app.scUser = SoundCloud::userName();
+        if (app.scUser.empty()) app.scUser = "вход выполнен";
+    }
     u64 heapLoggedAt = nowMs();
     while (appletMainLoop()) {
+        // Вход в SoundCloud: телефон прислал код — меняем его на токен.
+        if (app.scLogin.running()) {
+            std::string code;
+            if (app.scLogin.takeCode(code)) {
+                Job j{Job::ScLogin};
+                j.query = code;
+                j.url = app.scVerifier;
+                app.worker.post(j);
+                showToast(app, "SoundCloud: вхожу…");
+            }
+        }
         // HOME: отдаём музыку фону; вернулись — забираем обратно.
         AppletFocusState focus = appletGetFocusState();
         if (focus != lastFocus && nowMs() < app.focusGraceUntil) lastFocus = focus; // это была наша клавиатура
@@ -4137,6 +4544,7 @@ int main(int argc, char *argv[]) {
             }
             if (app.skipAt && nowMs() >= app.skipAt) playIndex(app, app.current + 1);
             maybeCrossfade(app);
+            warmNextSc(app);
         }
         if (app.ready) {
             ynTick(app);
@@ -4157,6 +4565,7 @@ int main(int argc, char *argv[]) {
     if (!exitedByUser) crashLog("выход: система закрыла приложение (appletMainLoop)");
     app.coverWorker.stop();
     app.downloader.stop(); // недокачанный файл останется .part и удалится при следующем запуске
+    app.scLogin.stop();
     app.worker.stop();
     for (auto &kv : app.covers) SDL_DestroyTexture(kv.second.tex);
     app.ui.shutdown();

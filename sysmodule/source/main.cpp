@@ -101,7 +101,7 @@ void __appExit(void) {
 }
 }
 
-static const char *MODULE_VERSION = "0.1.0"; // локальные сборки для отладки — "developer"
+static const char *MODULE_VERSION = "0.2.0"; // локальные сборки для отладки — "developer"
 static const u64 SYS_TID = 0x4200000000594D53ULL;
 
 static void sendLine(int fd, const std::string &s) {

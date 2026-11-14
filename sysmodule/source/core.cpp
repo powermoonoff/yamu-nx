@@ -59,6 +59,8 @@ static void saveAppVolume(int v) {
 bool Core::init(const char *tokenPath) {
     tokenPath_ = tokenPath;
     api_.noMp4 = true; // mp3 и AAC-поток умеем, контейнер MP4 на лету — нет
+    sc_.allowOriginal = false; // SoundCloud: только mp3 (оригиналы и AAC в fMP4 модуль не играет)
+    sc_.preferMp3 = true;
     if (!player_.init()) return false;
     player_.setVolume(appSetting("volume", 100));
     crossfade_ = appSetting("crossfade", 0);
@@ -81,6 +83,10 @@ void Core::command(const std::string &cmd) {
 
 void Core::entry(void *arg) { static_cast<Core *>(arg)->loop(); }
 
+static bool isNetError(const std::string &e);
+static bool ensureLogin(YandexApi &api, bool &loggedIn, const std::string &tokenPath, std::string &err,
+                        bool waitNet = false, bool quiet = false);
+
 void Core::loop() {
     while (!exit_) {
         std::string cmd;
@@ -90,6 +96,15 @@ void Core::loop() {
         }
         if (!cmd.empty()) exec(cmd);
         else { tick(); svcSleepThread(50 * MS); }
+        // После включения консоли сети ещё нет: пробуем войти сами каждые 5 с, чтобы к первому нажатию
+        // в оверлее всё было готово. Не сеть (нет токена и т. п.) — больше не пробуем.
+        static u64 bgLoginAt = 0;
+        static bool bgLoginGiveUp = false;
+        if (!loggedIn_ && !bgLoginGiveUp && armTicksToNs(armGetSystemTick() - bgLoginAt) > 5000000000ULL) {
+            bgLoginAt = armGetSystemTick();
+            std::string err;
+            if (!ensureLogin(api_, loggedIn_, tokenPath_, err, false, true) && !isNetError(err)) bgLoginGiveUp = true;
+        }
         if (loginJustHappened) {
             loginJustHappened = false;
             if (!libLoaded_) loadLibrary();
@@ -97,15 +112,29 @@ void Core::loop() {
     }
 }
 
-// Вход выполняется лениво — модуль может стартовать раньше, чем появится сеть.
-static bool ensureLogin(YandexApi &api, bool &loggedIn, const std::string &tokenPath, std::string &err) {
+static bool isNetError(const std::string &e) {
+    return e.find("Network") != std::string::npos || e.find("resolve") != std::string::npos ||
+           e.find("connect") != std::string::npos || e.find("Timeout") != std::string::npos;
+}
+
+// Вход выполняется лениво — модуль стартует при включении консоли раньше, чем появится сеть.
+// waitNet: команда от пользователя — если сети ещё нет, ждём её до 30 с, а не отказываем сразу.
+// quiet: фоновая попытка — неудачу без сети в журнал не пишем.
+static bool ensureLogin(YandexApi &api, bool &loggedIn, const std::string &tokenPath, std::string &err,
+                        bool waitNet, bool quiet) {
     if (loggedIn) return true;
-    if (!api.loadToken(tokenPath.c_str()) || !api.accountStatus()) {
+    for (int attempt = 0;; attempt++) {
+        if (api.loadToken(tokenPath.c_str()) && api.accountStatus()) break;
         err = api.lastError;
-        ymLog("[login] failed: %s", err.c_str());
-        return false;
+        bool net = isNetError(err);
+        if (!waitNet || !net || attempt >= 14) {
+            if (!quiet || !net) ymLog("[login] failed: %s", err.c_str());
+            return false;
+        }
+        if (attempt == 0) ymLog("[login] нет сети — жду до 30 с");
+        svcSleepThread(2000000000ULL);
     }
-    ymLog("[login] ok: %s", api.login.c_str());
+    ymLog("[login] ok");
     loggedIn = true;
     loginJustHappened = true;
     return true;
@@ -129,8 +158,8 @@ void Core::exec(const std::string &cmdLine) {
         in >> id;
         std::string err, url, codec;
         int kbps = 0;
-        if (!id.empty() && offlineFile(id).empty() && ensureLogin(api_, loggedIn_, tokenPath_, err) &&
-            api_.trackUrl(id, url, kbps, codec)) {
+        if (!id.empty() && offlineFile(id).empty() && (isSoundCloudId(id) || ensureLogin(api_, loggedIn_, tokenPath_, err)) &&
+            streamUrl(id, url, kbps, codec, err)) {
             prepId_ = id;
             prepUrl_ = url;
             prepCodec_ = codec;
@@ -171,7 +200,7 @@ void Core::exec(const std::string &cmdLine) {
 
     // Без сети переключать треки можно: скачанные играют с карты.
     std::string err;
-    if (cmd != "NEXT" && cmd != "PREV" && !ensureLogin(api_, loggedIn_, tokenPath_, err)) {
+    if (cmd != "NEXT" && cmd != "PREV" && !ensureLogin(api_, loggedIn_, tokenPath_, err, true)) {
         std::lock_guard<std::mutex> lk(stateM_);
         error_ = "Вход: " + err;
         return;
@@ -194,11 +223,11 @@ void Core::exec(const std::string &cmdLine) {
             if (like) liked_.insert(t.id);
             else liked_.erase(t.id);
         }
-        if (!api_.setLike(t, like)) {
+        if (!(isSoundCloudId(t.id) ? sc_.setLike(t.id, like) : api_.setLike(t, like))) {
             std::lock_guard<std::mutex> lk(stateM_);
             if (like) liked_.erase(t.id);
             else liked_.insert(t.id);
-            error_ = "Лайк: " + api_.lastError;
+            error_ = "Лайк: " + (isSoundCloudId(t.id) ? sc_.lastError : api_.lastError);
         }
     } else if (cmd == "LIBRARY") {
         loadLibrary();
@@ -236,6 +265,7 @@ void Core::exec(const std::string &cmdLine) {
         {
             std::lock_guard<std::mutex> lk(stateM_);
             wave_ = false;
+            scWave_ = false;
             sourceTitle_ = pl.title.empty() ? "Плейлист" : pl.title;
             queue_ = tracks;
             current_ = -1;
@@ -249,7 +279,7 @@ void Core::exec(const std::string &cmdLine) {
 
 void Core::startWave() {
     std::string err;
-    if (!ensureLogin(api_, loggedIn_, tokenPath_, err)) {
+    if (!ensureLogin(api_, loggedIn_, tokenPath_, err, true)) {
         std::lock_guard<std::mutex> lk(stateM_);
         error_ = "Вход: " + err;
         return;
@@ -265,6 +295,7 @@ void Core::startWave() {
     {
         std::lock_guard<std::mutex> lk(stateM_);
         wave_ = true;
+        scWave_ = false;
         sourceTitle_ = "Моя волна";
         queue_ = tracks;
         current_ = -1;
@@ -295,6 +326,8 @@ std::string Core::offlineFile(const std::string &id) {
     for (size_t i = 0; i < arr.size(); i++) {
         if (arr[i]["id"].asString() != id) continue;
         std::string file = arr[i]["file"].asString();
+        // SoundCloud: с карты модуль играет только mp3 (AAC в fMP4 и оригиналы — нет, тогда — поток).
+        if (isSoundCloudId(id) && (file.size() < 4 || file.compare(file.size() - 4, 4, ".mp3") != 0)) return "";
         FILE *t = file.empty() ? nullptr : fopen(file.c_str(), "rb");
         if (!t) return "";
         fclose(t);
@@ -316,6 +349,10 @@ void Core::playIndex(int idx, double startSec) {
     // Не стучимся в сеть на каждом треке: после неудачи ждём минуту.
     static u64 lastLoginFail = 0;
     bool online = loggedIn_;
+    if (!online) { // треку SoundCloud вход в Яндекс не нужен
+        std::lock_guard<std::mutex> lk(stateM_);
+        if (idx < (int)queue_.size() && isSoundCloudId(queue_[idx].id)) online = true;
+    }
     if (!online && (!lastLoginFail || armTicksToNs(armGetSystemTick() - lastLoginFail) > 60000000000ULL)) {
         online = ensureLogin(api_, loggedIn_, tokenPath_, err);
         if (!online) lastLoginFail = armGetSystemTick();
@@ -331,6 +368,20 @@ void Core::playIndex(int idx, double startSec) {
             return;
         }
         if (idx != from) startSec = 0;
+    }
+    if (scWave_ && !queue_.empty() && idx >= (int)queue_.size() - 2) { // волна SoundCloud: похожие на последний
+        std::vector<Track> more;
+        if (sc_.related(queue_.back().id, more)) {
+            std::lock_guard<std::mutex> lk(stateM_);
+            std::set<std::string> have;
+            for (auto &q : queue_) have.insert(q.id);
+            for (auto &m : more) if (have.insert(m.id).second) queue_.push_back(m);
+            if (current_ > 20) { // старое не держим — экономим память
+                queue_.erase(queue_.begin(), queue_.begin() + (current_ - 5));
+                idx -= current_ - 5;
+                current_ = 5;
+            }
+        }
     }
     if (online && wave_ && idx >= (int)queue_.size() - 1) { // подгружаем волну заранее
         std::vector<Track> more;
@@ -371,9 +422,10 @@ void Core::playIndex(int idx, double startSec) {
             bitrate = prepKbps_;
             ymLog("[track] %s: prepared url", t.id.c_str());
         }
-        if (!cached && !api_.trackUrl(t.id, url, bitrate, codec)) {
+        std::string uerr;
+        if (!cached && !streamUrl(t.id, url, bitrate, codec, uerr)) {
             std::lock_guard<std::mutex> lk(stateM_);
-            error_ = api_.lastError;
+            error_ = uerr;
             ymLog("[track] %s: %s", t.id.c_str(), error_.c_str());
             failStreak_++;
             return; // tick() пропустит трек
@@ -430,13 +482,13 @@ void Core::maybeCrossfade() {
         if (pos < dur - crossfade_ - 20) return;
         xfId_ = nt.id;
         xfSrc_.clear();
-        std::string file = offlineFile(nt.id), url, codec;
+        std::string file = offlineFile(nt.id), url, codec, err;
         int kbps = 0;
         if (!file.empty()) {
             xfSrc_ = file;
             xfCodec_ = codecOfFile(file);
             xfKbps_ = 0;
-        } else if (loggedIn_ && api_.trackUrl(nt.id, url, kbps, codec)) {
+        } else if ((loggedIn_ || isSoundCloudId(nt.id)) && streamUrl(nt.id, url, kbps, codec, err)) {
             xfSrc_ = url;
             xfCodec_ = codec.empty() ? "mp3" : codec;
             xfKbps_ = kbps;
@@ -517,6 +569,7 @@ void Core::playOffline(bool shuffle) {
     {
         std::lock_guard<std::mutex> lk(stateM_);
         wave_ = false;
+        scWave_ = false;
         shuffle_ = false;
         unshuffled_.clear();
         sourceTitle_ = "Скачанное";
@@ -600,6 +653,7 @@ void Core::handoffFromFile() {
     fclose(f);
     Json j = Json::parse(text);
     std::vector<Track> tracks;
+    std::vector<std::string> likedIds;
     const Json &arr = j["tracks"];
     for (size_t i = 0; i < arr.size(); i++) {
         Track t;
@@ -609,6 +663,7 @@ void Core::handoffFromFile() {
         t.artists = arr[i]["artists"].asString();
         t.durationMs = arr[i]["dur"].asInt();
         t.coverUri = arr[i]["coverUri"].asString();
+        if (arr[i]["liked"].asBool()) likedIds.push_back(t.id); // лайки SoundCloud модуль сам не знает
         if (!t.id.empty()) tracks.push_back(t);
     }
     int cur = (int)j["current"].asInt(-1);
@@ -620,6 +675,8 @@ void Core::handoffFromFile() {
     {
         std::lock_guard<std::mutex> lk(stateM_);
         wave_ = j["wave"].asBool();
+        scWave_ = j["scWave"].asBool();
+        liked_.insert(likedIds.begin(), likedIds.end());
         repeat_ = (int)j["repeat"].asInt(0);
         sourceTitle_ = j["source"].asString(wave_ ? "Моя волна" : "Плейлист");
         queue_ = tracks;
@@ -687,4 +744,14 @@ void Core::seekTo(double sec) {
     if (dur > 3 && sec > dur - 2) sec = dur - 2;
     ymLog("[seek] %d s", (int)sec);
     player_.play(curSrc_, curCodec_, sec, curKbps_, curDur_);
+}
+// Адрес потока по id трека: SoundCloud ("sc:…") — свой mp3-поток HLS, остальное — Яндекс.
+bool Core::streamUrl(const std::string &id, std::string &url, int &kbps, std::string &codec, std::string &err) {
+    if (isSoundCloudId(id)) {
+        if (!sc_.streamUrl(id, url, kbps, codec)) { err = sc_.lastError; return false; }
+        codec = "mp3"; // модулю выбираем только mp3 (preferMp3), «отрывок» в названии кодека ему не нужен
+        return true;
+    }
+    if (!api_.trackUrl(id, url, kbps, codec)) { err = api_.lastError; return false; }
+    return true;
 }

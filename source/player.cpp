@@ -1,5 +1,7 @@
 ﻿#include "player.hpp"
 #include "http.hpp"
+#include "soundcloud.hpp"
+#include "crashlog.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -33,7 +35,10 @@ public:
     std::string error() const;
 
 private:
-    static void netEntry(void *arg) { static_cast<Deck *>(arg)->netLoop(); }
+    static void netEntry(void *arg) {
+        static_cast<Deck *>(arg)->netLoop();
+        httpThreadDone(); // поток загрузки живёт один трек — закрываем его соединения через прокси
+    }
     static void decodeEntry(void *arg) { static_cast<Deck *>(arg)->decodeLoop(); }
     static int avioRead(void *opaque, uint8_t *buf, int size);
     static int64_t avioSeek(void *opaque, int64_t offset, int whence);
@@ -138,7 +143,22 @@ std::string Deck::error() const {
 
 void Deck::setError(const std::string &e) {
     std::lock_guard<std::mutex> lk(m_);
-    if (error_.empty()) error_ = e;
+    if (error_.empty()) {
+        error_ = e;
+        crashLog("[play] ошибка: %s", e.c_str());
+    }
+}
+
+// Хост и расширение файла из адреса — для журнала, без подписей и токенов.
+static std::string urlBrief(const std::string &u) {
+    size_t s = u.find("://");
+    size_t h = s == std::string::npos ? 0 : s + 3;
+    size_t ps = u.find('/', h);
+    std::string host = u.substr(h, ps == std::string::npos ? std::string::npos : ps - h);
+    std::string path = ps == std::string::npos ? "" : u.substr(ps, u.find('?', ps) == std::string::npos ? std::string::npos : u.find('?', ps) - ps);
+    size_t dot = path.rfind('.'), slash = path.rfind('/');
+    std::string ext = dot != std::string::npos && (slash == std::string::npos || dot > slash) ? path.substr(dot) : "";
+    return host + " …" + ext;
 }
 
 void Deck::netLoop() {
@@ -169,6 +189,84 @@ void Deck::netLoop() {
         fclose(f);
         std::lock_guard<std::mutex> lk(m_);
         netDone_ = true;
+        return;
+    }
+
+    // HLS (SoundCloud): плейлист из кусков — качаем их по порядку в тот же буфер, для FFmpeg это
+    // один непрерывный поток (mp3 склеивается как есть, AAC в fMP4 — с начальным куском первым).
+    if (url_.compare(0, 4, "hls:") == 0) {
+        // Плейлист качаем потоком (у потоковой загрузки нет общего тайм-аута — через прокси бывает медленно).
+        // Если вместо плейлиста пришёл сам аудиофайл — он сразу идёт в буфер плееру.
+        bool isFile = false, sniffed = false;
+        std::string plBody;
+        size_t fileLen = 0;
+        HttpResult pl;
+        std::string cachedFinal;
+        if (hlsCacheTake(url_.substr(4), cachedFinal, plBody)) { // плейлист скачан заранее (SoundCloud::warm)
+            pl.code = 200;
+            pl.finalUrl = cachedFinal;
+            sniffed = true;
+        } else pl = httpGet(url_.substr(4), {}, [&](const char *d, size_t n) {
+            if (stop_) return false;
+            if (!sniffed && plBody.size() + n >= 7) {
+                std::string head = plBody + std::string(d, n < 7 ? n : 7);
+                isFile = head.compare(0, 7, "#EXTM3U") != 0;
+                sniffed = true;
+                if (isFile) {
+                    std::lock_guard<std::mutex> lk(m_);
+                    data_.insert(data_.end(), plBody.begin(), plBody.end());
+                    plBody.clear();
+                    if (fileLen) { // точный размер — FFmpeg сможет сразу прыгнуть в конец (M4A с moov в конце)
+                        total_ = fileLen;
+                        totalExact_ = true;
+                    }
+                }
+            }
+            if (isFile) {
+                std::lock_guard<std::mutex> lk(m_);
+                data_.insert(data_.end(), d, d + n);
+            } else plBody.append(d, n);
+            return true;
+        }, [&](size_t len) { fileLen = len; });
+        if (isFile) {
+            std::lock_guard<std::mutex> lk(m_);
+            netDone_ = true;
+            crashLog("[hls] не плейлист, а файл: %u КБ, %s", (unsigned)(data_.size() / 1024),
+                     pl.code < 0 ? pl.error.c_str() : ("HTTP " + std::to_string(pl.code)).c_str());
+            if (!stop_ && pl.code != 200) error_ = "Download: " + (pl.code < 0 ? pl.error : "HTTP " + std::to_string(pl.code));
+            return;
+        }
+        std::vector<std::string> parts = pl.code == 200 ? hlsSegments(plBody, pl.finalUrl.empty() ? url_.substr(4) : pl.finalUrl)
+                                                        : std::vector<std::string>();
+        std::string err = pl.code < 0 ? pl.error : pl.code != 200 ? "HTTP " + std::to_string(pl.code) : parts.empty() ? "пустой плейлист" : "";
+        crashLog("[hls] плейлист: %s, кусков %d, первый %s%s", pl.code < 0 ? pl.error.c_str() : std::to_string(pl.code).c_str(),
+                 (int)parts.size(), parts.empty() ? "-" : urlBrief(parts[0]).c_str(),
+                 plBody.find("#EXT-X-KEY") != std::string::npos ? ", ЗАШИФРОВАН" : "");
+        for (size_t i = 0; err.empty() && i < parts.size() && !stop_; i++) {
+            HttpResult r;
+            for (int attempt = 0; attempt < 3 && !stop_; attempt++) { // кусок оборвался — качаем его заново
+                size_t mark;
+                {
+                    std::lock_guard<std::mutex> lk(m_);
+                    mark = data_.size();
+                }
+                r = httpGet(parts[i], {}, [this](const char *d, size_t n) {
+                    if (stop_) return false;
+                    std::lock_guard<std::mutex> lk(m_);
+                    data_.insert(data_.end(), d, d + n);
+                    return true;
+                });
+                if (r.code == 200) break;
+                std::lock_guard<std::mutex> lk(m_);
+                if (data_.size() > mark && readPos_ <= mark) data_.resize(mark); // недокачанный кусок — выкидываем
+                else if (data_.size() > mark) { err = "обрыв посреди куска"; break; }
+            }
+            if (err.empty() && r.code != 200 && !stop_) err = r.code < 0 ? r.error : "HTTP " + std::to_string(r.code);
+        }
+        std::lock_guard<std::mutex> lk(m_);
+        netDone_ = true;
+        crashLog("[hls] скачано %u КБ%s%s", (unsigned)(data_.size() / 1024), err.empty() ? "" : ", ошибка: ", err.c_str());
+        if (!stop_ && !err.empty()) error_ = "Download: " + err;
         return;
     }
 
@@ -241,14 +339,20 @@ void Deck::decodeLoop() {
     const AVCodec *codec = nullptr;
     AVChannelLayout outLayout = AV_CHANNEL_LAYOUT_STEREO;
     std::vector<s16> out;
+    int64_t skipTs = AV_NOPTS_VALUE; // после перемотки: пакеты раньше этого — выкидываем
 
     fmt = avformat_alloc_context();
     fmt->pb = avio;
     fmt->flags |= AVFMT_FLAG_CUSTOM_IO;
+    // SoundCloud AAC приходит как fMP4 из кусков. Без IGNIDX демуксер MP4 ещё до старта обходит все
+    // фрагменты ради индекса перемотки — то есть ждёт весь трек. Перемотку вперёд за прочитанное
+    // делаем сами: пропуском пакетов до нужного времени (skipTs ниже).
+    if (url_.compare(0, 4, "hls:") == 0) fmt->flags |= AVFMT_FLAG_IGNIDX;
     if (avformat_open_input(&fmt, nullptr, nullptr, nullptr) < 0) { fmt = nullptr; setError("Unknown audio format"); goto done; }
     if (avformat_find_stream_info(fmt, nullptr) < 0) { setError("Can't read stream info"); goto done; }
     si = av_find_best_stream(fmt, AVMEDIA_TYPE_AUDIO, -1, -1, &codec, 0);
     if (si < 0 || !codec) { setError("No audio stream / codec"); goto done; }
+    if (url_.compare(0, 4, "hls:") == 0) crashLog("[hls] формат %s, кодек %s", fmt->iformat ? fmt->iformat->name : "?", codec->name);
 
     cc = avcodec_alloc_context3(codec);
     avcodec_parameters_to_context(cc, fmt->streams[si]->codecpar);
@@ -283,6 +387,7 @@ void Deck::decodeLoop() {
                     swr_close(swr);
                     swr_init(swr);
                 }
+                skipTs = ts; // демуксер мог встать раньше (в fMP4 — на последний прочитанный фрагмент)
                 out.clear();
                 std::lock_guard<std::mutex> lk(pm_);
                 pcm_.clear();
@@ -295,6 +400,10 @@ void Deck::decodeLoop() {
                 if (rc != AVERROR_EOF && rc != AVERROR_EXIT) setError("Read error");
                 if (rc == AVERROR_EOF) finished = true;
                 break;
+            }
+            if (skipTs != AV_NOPTS_VALUE && pkt->stream_index == si && pkt->pts != AV_NOPTS_VALUE) {
+                if (pkt->pts + pkt->duration < skipTs) { av_packet_unref(pkt); continue; }
+                skipTs = AV_NOPTS_VALUE;
             }
             if (pkt->stream_index == si && avcodec_send_packet(cc, pkt) == 0) {
                 while (avcodec_receive_frame(cc, frame) == 0) {

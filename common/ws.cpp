@@ -57,6 +57,11 @@ bool WebSocket::connect(const std::string &url, const std::vector<std::string> &
     curl_easy_setopt(c, CURLOPT_CONNECT_ONLY, 1L);
     curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 15L);
+    // Только IPv4: у Свича нет IPv6, а у части серверов (SoundCloud за CloudFront) есть адреса IPv6 —
+    // curl пытался соединиться по ним и упирался в тайм-аут.
+    curl_easy_setopt(c, CURLOPT_IPRESOLVE, CURL_IPRESOLVE_V4);
+    std::string proxy = httpProxyFor("https://" + host + "/"); // Коннект — через прокси, только если он «на всё»
+    if (!proxy.empty()) curl_easy_setopt(c, CURLOPT_PROXY, proxy.c_str());
     httpUseSharedSockets(c);
     CURLcode rc = curl_easy_perform(c);
     if (rc != CURLE_OK) { err = curl_easy_strerror(rc); close(); return false; }
